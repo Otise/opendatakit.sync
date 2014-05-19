@@ -18,6 +18,8 @@
 	<string name="server_url">Aggregate URL:</string>
 	<string name="default_server_url">http://opendatakit-2.appspot.com</string>
 	<string name="account">Account:</string>
+	<string name="sync_progress_state_label">Sync Progress State</string>
+	<string name="sync_progress_message_label">Sync Progress Message</string>
 	<string name="save_settings">Save settings</string>
 	<string name="auth_account">Authorize account</string>
 	<string name="sync_now_pull">Sync now</string>
