@@ -60,7 +60,6 @@ import org.opendatakit.aggregate.odktables.rest.entity.TableDefinitionResource;
 import org.opendatakit.aggregate.odktables.rest.entity.TableResource;
 import org.opendatakit.aggregate.odktables.rest.entity.TableResourceList;
 import org.opendatakit.aggregate.odktables.rest.entity.RowOutcome.OutcomeType;
-import org.opendatakit.common.android.sync.aggregate.SyncTag;
 import org.opendatakit.common.android.utilities.ODKFileUtils;
 import org.opendatakit.common.android.utilities.WebUtils;
 import org.opendatakit.httpclientandroidlib.Header;
@@ -421,17 +420,17 @@ public class AggregateSynchronizer implements Synchronizer {
     return tables;
   }
 
-  private void updateResource( String tableId, SyncTag syncTag) {
+  private void updateResource( String tableId, String tableSchemaETag, String tableDataETag) {
+    // access tr from local cache...
     TableResource tr = resources.get(tableId);
     if ( tr == null ) return;
-    if (!( tr.getSchemaETag() == syncTag.getSchemaETag() ||
-          (tr.getSchemaETag() != null && tr.getSchemaETag().equals(syncTag.getSchemaETag()))) ) {
+    if (!( tr.getSchemaETag().equals(tableSchemaETag)) ) {
       // schemaETag is stale...
       resources.remove(tableId);
       return;
     }
-    // otherwise, update the dataETag
-    tr.setDataETag(syncTag.getDataETag());
+    // found matching tr -- update its dataETagAtModification field
+    tr.setDataETag(tableDataETag);
   }
 
   @Override
@@ -441,12 +440,12 @@ public class AggregateSynchronizer implements Synchronizer {
   }
 
   @Override
-  public TableResource createTable(String tableId, SyncTag syncTag, ArrayList<Column> columns)
+  public TableResource createTable(String tableId, String schemaETag, ArrayList<Column> columns)
       throws ResourceAccessException {
 
     // build request
     URI uri = normalizeUri(aggregateUri, getTablesUriFragment() + tableId);
-    TableDefinition definition = new TableDefinition(tableId, syncTag.getSchemaETag(), columns);
+    TableDefinition definition = new TableDefinition(tableId, schemaETag, columns);
     HttpEntity<TableDefinition> requestEntity = new HttpEntity<TableDefinition>(definition,
                                                                                 requestHeaders);
     // create table
@@ -524,28 +523,28 @@ public class AggregateSynchronizer implements Synchronizer {
    * .String, java.lang.String)
    */
   @Override
-  public IncomingRowModifications getUpdates(String tableId, SyncTag currentTag) throws IOException {
+  public IncomingRowModifications getUpdates(String tableId, String schemaETag, String dataETag) throws IOException {
     IncomingRowModifications modification = new IncomingRowModifications();
 
     TableResource resource = getTable(tableId);
 
     // get current and new sync tags
     // This tag is ultimately returned. May8--make sure it works.
-    SyncTag newTag = new SyncTag(resource.getDataETag(),
-                                 resource.getSchemaETag());
+    String resourceSchemaETag = resource.getSchemaETag();
+    String resourceDataETag = resource.getDataETag();
 
     // TODO: need to loop here to process segments of change
     // vs. an entire bucket of changes.
 
     // get data updates
-    if (newTag.getDataETag() != currentTag.getDataETag() &&
-        (newTag.getDataETag() == null || !newTag.getDataETag().equals(currentTag.getDataETag()))) {
+    if (((resource.getDataETag() == null) && (dataETag != null)) ||
+         !resource.getDataETag().equals(dataETag)) {
       URI url;
-      if (currentTag.getDataETag() == null) {
-        url = normalizeUri(resource.getDataUri(), "/");;
+      if ((resource.getDataETag() == null) || dataETag == null) {
+        url = normalizeUri(resource.getDataUri(), "/");
       } else {
         String diffUri = resource.getDiffUri();
-        url = normalizeUri(diffUri, "?data_etag=" + escapeSegment(currentTag.getDataETag()));
+        url = normalizeUri(diffUri, "?data_etag=" + escapeSegment(dataETag));
       }
       RowResourceList rows;
       try {
@@ -555,6 +554,7 @@ public class AggregateSynchronizer implements Synchronizer {
         throw e;
       }
 
+      modification.setTableSchemaETag(resourceSchemaETag);
       Map<String, SyncRow> syncRows = new HashMap<String, SyncRow>();
       for (RowResource row : rows.getRows()) {
         SyncRow syncRow = new SyncRow(row.getRowId(), row.getRowETag(), row.isDeleted(),
@@ -564,11 +564,10 @@ public class AggregateSynchronizer implements Synchronizer {
                                       row.getFilterScope(),
                                       row.getValues());
         syncRows.put(row.getRowId(), syncRow);
+        modification.setTableDataETag(row.getDataETagAtModification());
       }
       modification.setRows(syncRows);
     }
-
-    modification.setTableSyncTag(newTag);
     return modification;
   }
 
@@ -619,16 +618,17 @@ public class AggregateSynchronizer implements Synchronizer {
    *
    * @param tableId
    *          the unique identifier of the table
-   * @param currentSyncTag
-   *          the last value that was stored as the syncTag
+   * @param tableSchemaETag
+   *          tracks the current table instance
+   * @param tableDataETag
+   *          tracks the dataETagAtModification for this table instance.
    * @param rowToInsertOrUpdate
    *          the row to insert or update
    * @return a RowModification containing the (rowId, rowETag, table dataETag) after the modification
    */
-  public RowModification insertOrUpdateRow(String tableId, SyncTag currentSyncTag, SyncRow rowToInsertOrUpdate)
+  public RowModification insertOrUpdateRow(String tableId, String tableSchemaETag, String tableDataETag, SyncRow rowToInsertOrUpdate)
       throws ResourceAccessException {
         TableResource resource = getTable(tableId);
-        SyncTag lastKnownServerSyncTag = new SyncTag(currentSyncTag.getDataETag(), currentSyncTag.getSchemaETag());
 
         Row row = Row.forUpdate(rowToInsertOrUpdate.getRowId(), rowToInsertOrUpdate.getRowETag(),
             rowToInsertOrUpdate.getFormId(), rowToInsertOrUpdate.getLocale(),
@@ -649,11 +649,10 @@ public class AggregateSynchronizer implements Synchronizer {
         RowResource inserted = insertedEntity.getBody();
         Log.i(LOGTAG, "[insertOrUpdateRows] setting data etag to row's last "
             + "known dataetag at modification: " + inserted.getDataETagAtModification());
-        lastKnownServerSyncTag.setDataETag(inserted.getDataETagAtModification());
 
-        updateResource(tableId, lastKnownServerSyncTag);
+        updateResource(tableId, tableSchemaETag, inserted.getDataETagAtModification());
 
-        return new RowModification( inserted.getRowId(), inserted.getRowETag(), lastKnownServerSyncTag);
+        return new RowModification( inserted.getRowId(), inserted.getRowETag(), tableSchemaETag, inserted.getDataETagAtModification());
       }
 
   /*
@@ -664,10 +663,9 @@ public class AggregateSynchronizer implements Synchronizer {
    * .String, java.util.List)
    */
   @Override
-  public RowModification deleteRow(String tableId, SyncTag currentSyncTag, SyncRow rowToDelete)
+  public RowModification deleteRow(String tableId, String tableSchemaETag, String tableDataETag, SyncRow rowToDelete)
       throws ResourceAccessException {
     TableResource resource = getTable(tableId);
-    SyncTag syncTag = currentSyncTag;
     String lastKnownServerDataTag = null; // the data tag of the whole table.
     String rowId = rowToDelete.getRowId();
     URI url = normalizeUri(resource.getDataUri(), escapeSegment(rowId) + "?row_etag=" + escapeSegment(rowToDelete.getRowETag()));
@@ -681,14 +679,15 @@ public class AggregateSynchronizer implements Synchronizer {
     if (lastKnownServerDataTag == null) {
       // do something--b/c the delete hasn't worked.
       Log.e(LOGTAG, "delete call didn't return a known data etag.");
+      throw new ResourceAccessException("Unable to extract dataETag at modification");
     }
+    
     Log.i(LOGTAG, "[deleteRows] setting data etag to last known server tag: "
         + lastKnownServerDataTag);
-    syncTag.setDataETag(lastKnownServerDataTag);
 
-    updateResource(tableId, syncTag);
+    updateResource(tableId, tableSchemaETag, lastKnownServerDataTag);
 
-    return new RowModification(rowToDelete.getRowId(), null, syncTag);
+    return new RowModification(rowToDelete.getRowId(), null, tableSchemaETag, lastKnownServerDataTag);
   }
 
   private static List<String> filterOutTableIdAssetFiles(List<String> relativePaths) {
